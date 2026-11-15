@@ -38,7 +38,8 @@ every round, so you both defend (defuse) and attack (plant).
 
 - **5v5 + bots** — you + 4 friendly bots vs 5 enemy bots, with waypoint
   pathfinding, site pushes, plant/defuse runs, burst fire, strafing, falling
-  back when hurt, and radio callouts
+  back when hurt, and radio callouts. Bots react to what they **see and
+  hear**: a nearby enemy gunshot pulls them over to investigate
 - **Bomb objective** — plant on Site A (Foundry) or B (Depot), 35 s
   detonation timer with accelerating beeps; defuse to save the site
 - **Buy economy** — $800 start, $300/kill, $3,250 round win / $1,900 loss,
@@ -72,34 +73,52 @@ every round, so you both defend (defuse) and attack (plant).
   `game/` and `screenshots/` to the output directory and writes
   `dossier.json` with `buildDossier` from `vendor/makefun-threejs.ts`
   (the kit's copy, unchanged). Two runs write identical bytes.
-- `game/index.html` + `game/main.js` — the whole game: three.js 0.187.0
+- `game/index.html` + `game/*.js` — the whole game: three.js 0.187.0
   (vendored `three.module.min.js` / `three.core.min.js`, byte for byte the
-  kit's files) via an import map, one ES module, no build step.
-- `game/main.js` — renderer, fixed-step (1/60 s) simulation decoupled from
-  rendering, bot AI (waypoints, bursts, reactions, callouts), weapons,
-  economy, HUD and minimap. Hot loops reuse scratch vectors (no per-frame
-  allocation); bullets resolve the nearest of hit-mesh / wall collider /
-  player capsule, so walls stop bullets.
+  kit's files) via an import map, ES modules with one job each, no build step:
+  `util` (helpers), `data` (tuning), `audio` (synthesized sound), `state`
+  (the one place match state lives), `textures` (procedural art), `world`
+  (renderer, map, colliders, waypoints), `actors` (fighters, viewmodel gun,
+  shop), `combat` (shooting, damage, grenades, FX), `ai` (bot brains),
+  `rounds` (match flow, spike, economy), `ui` (the only DOM module),
+  `input` (keyboard/mouse/pointer lock), `main` (player movement,
+  fixed-step loop, boot).
+- `game/main.js` — fixed-step (1/60 s) simulation decoupled from rendering,
+  player movement and the main loop. Hot loops reuse scratch vectors (no
+  per-frame allocation — line of sight reuses one raycaster, bot movement
+  reuses scratch vectors); HUD and minimap refresh at most 10×/s with
+  change-cached writes instead of every step. Bullets resolve the nearest
+  of hit-mesh / wall collider / player capsule, so walls stop bullets.
 - `screenshots/` — 4 real renders of the game's own code (`?shot=1..4`
   staged first-person views), 1280×480 JPEG, each under the 256 KiB gate.
 
 ## Checks
 
 - `main.ts` run twice → byte-identical output (`diff -r` clean);
-  dossier ~541 KB (< 1.5 MiB), source text ~97 KB (< 160 KiB)
-- Screenshots: 4 files, 1280×480, 76–89 KB each (limit 256 KiB)
+  dossier 483,969 bytes (< 1.5 MiB), source text 116,704 bytes (< 160 KiB,
+  all 14 source files included whole, nothing cut)
+- Sandbox-grader simulation: `main.ts` run twice as uid 65534 (`nobody`)
+  from a read-only repo copy into writable outputs → byte-identical;
+  a stale foreign file in the output dir survives (the program never
+  removes `/output` itself — the EPERM failure of round 1 stays fixed)
+- Screenshots: 4 files, 1280×480, 63–79 KB each (limit 256 KiB)
 - three.js files byte-identical to the kit's 0.187.0 files; import map maps
   `"three"` to `./three.module.min.js`; no network reference anywhere in
   `game/` (no fetch, no external URL, no dynamic import)
 - Headless play-test (Chrome + SwiftShader): boots with no page errors,
-  bots fight and kill each other, rounds progress (clock → roundEnd → buy
-  → round 2 live), HUD/minimap render
-- Scenario tests (headless, scripted): walls block bot and player shots
-  while open shots wound; a round never ends while the player (a Jackal)
-  is alive; the player picks up a dropped spike; 120 fixed steps advance
-  game time by exactly 2 s; movement accelerates and decays on release
-- `node --check game/main.js` → OK (`main.ts` is TypeScript: run it with
-  Node 22+, `node main.ts`, not `--check`)
+  bots fight and kill each other, rounds progress (round 1 ends → buy →
+  round 2 live), bots investigate gunfire they hear (`heardEvents` > 0),
+  HUD/minimap render
+- Scenario checks (headless, scripted, re-run on v1.2.0): holding W moves
+  the player forward and velocity decays on release (`MOVE_PASS`); the
+  combat/round code is ported verbatim into modules, so the v1.1.0
+  verifications still hold — walls block bot and player shots while open
+  shots wound; a round never ends while the player (a Jackal) is alive;
+  the player picks up a dropped spike; 120 fixed steps advance game time
+  by exactly 2 s
+- All 13 game modules parse as ES modules (`vm.SourceTextModule`); import
+  graph is acyclic (`state` ← `world`/`actors`/`combat`/`ai`/`rounds` ←
+  `ui`/`input` ← `main`)
 - Note: `makefun grade-local` refuses this competition by design — its
   scorer and reference data stay on the server, so the house grades it
   after submission. No local sealed score exists.
