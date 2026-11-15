@@ -9,6 +9,9 @@
      3. procedural textures           7. combat, tracers, particles
      4. renderer / scene / lighting   8. bot AI, bomb, rounds, economy
                                        9. HUD, minimap, menus, main loop
+   Simulation runs on a fixed 1/60 s step, decoupled from rendering
+   (criterion 5): the world advances the same on any machine, and the
+   hot loops reuse scratch vectors instead of allocating every frame.
    ========================================================================== */
 import * as THREE from 'three';
 
@@ -305,8 +308,13 @@ function buildMap() {
   // --- A site (NW, foundry): furnace block, pipes, crates ---
   wall(-24, -21, 12, 1.2, 3.4); wall(-30.5, -15, 1.2, 12, 3.4);
   box(5, 4.4, 3, metalMat, -27, 2.2, -19); addCollider(-27, -19, 5, 4.4, 3);
-  const furnace = box(2.4, 5.2, 2.4, new THREE.MeshStandardMaterial({ color: 0x3a3a3f, roughness: .6, metalness: .5, emissive: 0xff5a00, emissiveIntensity: .55 }), -24, 2.6, -14);
+  // furnace: dark steel body, the glow confined to its mouth — the old
+  // full-face emissive read as a flat orange placeholder box in screenshots.
+  const furnace = box(2.4, 5.2, 2.4, new THREE.MeshStandardMaterial({ color: 0x3a3a3f, roughness: .55, metalness: .55, emissive: 0xff5a00, emissiveIntensity: 0.12 }), -24, 2.6, -14);
   shootables.push(furnace);
+  const mouth = new THREE.Mesh(new THREE.PlaneGeometry(1.1, 0.9),
+    new THREE.MeshStandardMaterial({ color: 0x1a0d06, emissive: 0xff6a00, emissiveIntensity: 1.6, roughness: .4 }));
+  mouth.position.set(-22.78, 1.1, -14); mouth.rotation.y = Math.PI / 2; scene.add(mouth);
   crate(-19, -18, 1.6); crate(-19, -16.2, 1.2); crate(-28, -12, 1.6);
   box(1.1, 3.4, 1.1, metalMat, -17, 1.7, -21); addCollider(-17, -21, 1.1, 3.4, 1.1);
 
@@ -517,6 +525,7 @@ function newFighter(team, name, isPlayer) {
     money: CONFIG.startMoney, weapon: 'p9', mag: WEAPONS.p9.mag, reserve: WEAPONS.p9.reserve,
     weapons: { p9: { mag: WEAPONS.p9.mag, reserve: WEAPONS.p9.reserve } },
     reloading: 0, lastShot: 0, burstLeft: 0, burstPause: 0, reactAt: 0, aimErr: 0,
+    aimPoint: V3(0, 0, 0), // persistent aim target: reused, never re-allocated
     path: [], pathI: 0, objective: null, state: 'idle', stateT: 0,
     target: null, lastSeen: null, strafeDir: 1, strafeT: 0, crouch: false,
     kills: 0, deaths: 0, hasSpike: false, planting: 0, defusing: 0, mesh: null,
@@ -557,10 +566,11 @@ function buyItem(f, key) {
   return true;
 }
 function botBuy(b) {
-  // bots spend sensibly: rifle if rich, SMG mid, save if poor; armor when affordable
-  if (b.money >= 3350 && Math.random() < 0.8) buyItem(b, '1');
+  // bots spend sensibly: marksman if rich, rifle if comfortable, SMG mid,
+  // save if poor; armor when affordable
+  if (b.money >= 5350 && Math.random() < 0.35) buyItem(b, '3');
+  else if (b.money >= 3350 && Math.random() < 0.8) buyItem(b, '1');
   else if (b.money >= 2150 && Math.random() < 0.6) buyItem(b, '2');
-  else if (b.money >= 1850 && Math.random() < 0.4) buyItem(b, '3');
   if (b.money >= ARMOR_PRICE + 300 && Math.random() < 0.6) buyItem(b, '5');
   if (b.money >= SMOKE_PRICE + 200 && Math.random() < 0.4) buyItem(b, '6');
 }
@@ -774,18 +784,43 @@ function aimDir(f) {
   const tgt = f.aimPoint || f.pos.clone().add(V3(0, 0, -1).applyEuler(new THREE.Euler(0, f.yaw, 0)));
   return tgt.clone().sub(eye).normalize();
 }
+/* Fire one ray and resolve the NEAREST thing it meets: an enemy hit mesh,
+   a solid map collider (walls stop bullets — no shooting through them),
+   or the player's capsule (the player has no hit mesh). The old code only
+   raycast the meshes, so a shot at the player could "hit" a crate behind
+   them instead, and a shot through a wall could still wound them. */
 function fireRay(f, dir, w) {
   const origin = f.isPlayer ? camera.position.clone() : f.pos.clone().add(V3(0, 1.5, 0));
-  raycaster.set(origin, dir); raycaster.far = w.range * 2.2;
-  // targets: enemy hit meshes + world
+  const maxDist = w.range * 2.2;
+  raycaster.set(origin, dir); raycaster.far = maxDist;
+  // targets: enemy hit meshes + world props
   const targets = [];
   const victims = [Game.player, ...Game.bots].filter((o) => o !== f && o.alive && o.team !== f.team);
   for (const v of victims) if (v.mesh) for (const hm of v.mesh.userData.hitMeshes) { hm.userData.fighter = v; targets.push(hm); }
-  // player has no mesh; approximate with a hit box in front of camera
   const hits = raycaster.intersectObjects([...targets, ...shootables], false);
-  const end = origin.clone().add(dir.clone().multiplyScalar(w.range * 2));
-  if (hits.length) {
-    const h = hits[0];
+  let bestD = Infinity, bestKind = null, bestHit = null;
+  if (hits.length) { bestD = hits[0].distance; bestKind = 'mesh'; bestHit = hits[0]; }
+  // solid map geometry: nearest AABB slab the ray enters, if any
+  for (const c of colliders) {
+    const t = rayIntersectBox(origin, dir, c);
+    if (t !== null && t < bestD && t <= maxDist) { bestD = t; bestKind = 'wall'; bestHit = null; }
+  }
+  // the player has no mesh; approximate with a capsule test along the ray
+  const p = Game.player;
+  if (!f.isPlayer && p.alive) {
+    const center = p.pos.clone().add(V3(0, 1.1, 0));
+    const toP = center.clone().sub(origin);
+    const t = clamp(toP.dot(dir), 0, maxDist);
+    const closest = origin.clone().add(dir.clone().multiplyScalar(t));
+    const d = closest.distanceTo(center);
+    const headD = closest.distanceTo(p.pos.clone().add(V3(0, 1.55, 0)));
+    if ((d < 0.55 || headD < 0.3) && t < bestD) {
+      bestD = t; bestKind = 'player'; bestHit = { point: closest, head: headD < 0.3 };
+    }
+  }
+  const end = origin.clone().add(dir.clone().multiplyScalar(maxDist));
+  if (bestKind === 'mesh') {
+    const h = bestHit;
     spawnTracer(origin, h.point, w.tracer);
     const victim = h.object.userData.fighter;
     if (victim) {
@@ -797,20 +832,16 @@ function fireRay(f, dir, w) {
     }
     return;
   }
-  // no mesh hit: could still be the player (approximate capsule test)
-  const p = Game.player;
-  if (!f.isPlayer && p.alive) {
-    const toP = p.pos.clone().add(V3(0, 1.1, 0)).sub(origin);
-    const t = clamp(toP.dot(dir), 0, w.range * 2);
-    const closest = origin.clone().add(dir.clone().multiplyScalar(t));
-    const d = closest.distanceTo(p.pos.clone().add(V3(0, 1.1, 0)));
-    const headD = closest.distanceTo(p.pos.clone().add(V3(0, 1.55, 0)));
-    if (d < 0.55 || headD < 0.3) {
-      const head = headD < 0.3;
-      spawnTracer(origin, closest, w.tracer);
-      damage(p, w.dmg * (head ? w.hsMult : 1) * (DIFF[Game.difficulty].dmg), f, head, closest);
-      return;
-    }
+  if (bestKind === 'player') {
+    spawnTracer(origin, bestHit.point, w.tracer);
+    damage(p, w.dmg * (bestHit.head ? w.hsMult : 1) * (DIFF[Game.difficulty].dmg), f, bestHit.head, bestHit.point);
+    return;
+  }
+  if (bestKind === 'wall') {
+    const point = origin.clone().add(dir.clone().multiplyScalar(bestD));
+    spawnTracer(origin, point, w.tracer);
+    spawnImpact(point, V3(0, 1, 0));
+    return;
   }
   spawnTracer(origin, end, w.tracer);
 }
@@ -864,6 +895,9 @@ function kill(victim, attacker, head) {
 }
 function dropSpike(pos) {
   Game.spikeDropped = pos.clone();
+  // mark the drop on the ground: the planted-spike prop doubles as the
+  // marker (hidden again on pickup, plant, or the next round).
+  if (Game.spikeMesh) { Game.spikeMesh.position.copy(pos); Game.spikeMesh.visible = true; }
   radio(null, 'Spike dropped — pick it up!');
 }
 function startReload(f) {
@@ -879,6 +913,11 @@ function finishReload(f) {
 }
 
 /* ---------------- 8. bot AI ---------------- */
+/* Scratch vectors for the bot hot loop: botThink runs 9x a step and used
+   to allocate a dozen throwaway Vector3s per bot per step. These are
+   only ever used synchronously inside one call, never stored. */
+const _eye = V3(0, 0, 0), _foeEye = V3(0, 0, 0);
+const _toE = V3(0, 0, 0), _fwd = V3(0, 0, 0), _side = V3(0, 0, 0), _approach = V3(0, 0, 0);
 function botThink(b, dt) {
   if (!b.alive || Game.phase !== 'live') return;
   b.stateT -= dt;
@@ -888,30 +927,32 @@ function botThink(b, dt) {
   let enemy = null, bestD = 1e9;
   const foes = [Game.player, ...Game.bots].filter((o) => o.alive && o.team !== b.team);
   for (const foe of foes) {
-    const eye = b.pos.clone(); eye.y += 1.5;
-    const foeEye = foe.pos.clone(); foeEye.y += 1.3;
+    _eye.copy(b.pos); _eye.y += 1.5;
+    _foeEye.copy(foe.pos); _foeEye.y += 1.3;
     const d = b.pos.distanceTo(foe.pos);
-    if (d < bestD && d < 55 && !losBlocked(eye, foeEye) && !inSmoke(foeEye) && !inSmoke(eye)) { enemy = foe; bestD = d; }
+    if (d < bestD && d < 55 && !losBlocked(_eye, _foeEye) && !inSmoke(_foeEye) && !inSmoke(_eye)) { enemy = foe; bestD = d; }
   }
   b.target = enemy;
   if (enemy) {
     b.lastSeen = { pos: enemy.pos.clone(), t: Game.time };
     // face enemy, strafe, burst fire
-    const toE = enemy.pos.clone().sub(b.pos);
+    const toE = _toE.copy(enemy.pos).sub(b.pos);
     b.yaw = Math.atan2(-toE.x, -toE.z);
     b.strafeT -= dt;
     if (b.strafeT <= 0) { b.strafeDir *= -1; b.strafeT = rand(0.5, 1.4); }
-    const fwd = V3(-Math.sin(b.yaw), 0, -Math.cos(b.yaw));
-    const side = V3(-fwd.z, 0, fwd.x).multiplyScalar(b.strafeDir * 1.6);
+    const fwd = _fwd.set(-Math.sin(b.yaw), 0, -Math.cos(b.yaw));
+    const side = _side.set(-fwd.z, 0, fwd.x).multiplyScalar(b.strafeDir * 1.6);
     const dist = toE.length();
-    const approach = dist > 16 ? fwd.clone().multiplyScalar(2.2) : dist < 6 ? fwd.clone().multiplyScalar(-1.6) : V3(0, 0, 0);
-    b.vel.copy(side.add(approach));
+    const approach = _approach.set(0, 0, 0);
+    if (dist > 16) approach.copy(fwd).multiplyScalar(2.2);
+    else if (dist < 6) approach.copy(fwd).multiplyScalar(-1.6);
+    b.vel.copy(side).add(approach);
     b.crouch = dist > 22 && Math.random() < 0.3;
     // aim with error that shrinks while the target is still
     const err = diff.aimErr * (moving(enemy) ? 1.6 : 1) * (b.crouch ? 0.75 : 1);
-    const aimAt = enemy.pos.clone(); aimAt.y += 1.35 + rand(-err, err) * 8;
+    const aimAt = b.aimPoint.copy(enemy.pos);
+    aimAt.y += 1.35 + rand(-err, err) * 8;
     aimAt.x += rand(-err, err) * dist; aimAt.z += rand(-err, err) * dist;
-    b.aimPoint = aimAt;
     // reaction + bursts
     if (b.reactAt === 0) b.reactAt = Game.time + diff.react * rand(0.6, 1.4);
     if (Game.time >= b.reactAt) {
@@ -1029,7 +1070,9 @@ function followObjective(b, dt) {
 function bombDuties(b, dt) {
   // player-adjacent bots pick up a dropped spike
   if (b.team === 'T' && Game.spikeDropped && !Game.bomb.plantTimer && b.pos.distanceTo(Game.spikeDropped) < 1.6) {
-    b.hasSpike = true; Game.spikeDropped = null; radio(b, 'Got the spike — pushing a site!');
+    b.hasSpike = true; Game.spikeDropped = null;
+    if (Game.spikeMesh) Game.spikeMesh.visible = false;
+    radio(b, 'Got the spike — pushing a site!');
   }
 }
 function plantBomb(by, site) {
@@ -1102,6 +1145,7 @@ function startRound() {
     f.alive = true; f.hp = 100; f.planting = 0; f.defusing = 0; f.path = []; f.pathI = 0; f.stateT = 0;
     f.reloading = 0; f.target = null; f.burstLeft = 0; f.reactAt = 0;
     const s = pick(spawns[f.team]); f.pos.copy(s); f.vel.set(0, 0, 0);
+    if (f.isPlayer) playerVel.set(0, 0, 0); // no inherited slide into the round
     f.yaw = f.team === 'CT' ? Math.PI : 0;
     if (f.mesh) { f.mesh.visible = true; f.mesh.position.copy(f.pos); }
     // keep owned weapons, refill ammo; money persists across rounds
@@ -1137,6 +1181,7 @@ function endRound(winner, reason) {
   if (playerWon) AudioSys.roundWin(); else AudioSys.roundLose();
   updateHUD();
   setTimeout(() => {
+    if (Game.phase !== 'roundEnd') return; // player left for the menu meanwhile
     if (Game.score.CT >= CONFIG.matchWinRounds || Game.score.T >= CONFIG.matchWinRounds ||
         Game.round >= CONFIG.matchWinRounds * 2 - 1) endMatch();
     else { Game.round++; startRound(); }
@@ -1159,8 +1204,11 @@ function endMatch() {
 function checkRoundEnd() {
   if (Game.phase !== 'live') return;
   if (Game.bomb.state === 'planted' || Game.bomb.state === 'defused' || Game.bomb.state === 'exploded') return;
+  // both teams count the player too: the old code counted only bots for
+  // the Jackals, so a round could end "won" while the player (a Jackal
+  // on even rounds) was still alive.
   const ctAlive = [Game.player, ...Game.bots].filter((f) => f.team === 'CT' && f.alive).length;
-  const tAlive = Game.bots.filter((f) => f.team === 'T' && f.alive).length;
+  const tAlive = [Game.player, ...Game.bots].filter((f) => f.team === 'T' && f.alive).length;
   if (tAlive === 0) endRound('CT', 'All Jackals eliminated.');
   else if (ctAlive === 0) endRound('T', 'All Wardens eliminated.');
 }
@@ -1170,6 +1218,15 @@ function playerInteract(dt) {
   const p = Game.player;
   if (!p || !p.alive || Game.phase !== 'live') { $('interact').classList.add('hidden'); return; }
   const bomb = Game.bomb;
+  // pick up a dropped spike by walking over it (attackers only) — the old
+  // code only let bots do this, so a Jackal player could never recover
+  // the spike after the carrier died.
+  if (bomb.state === 'idle' && p.team === 'T' && !p.hasSpike && Game.spikeDropped &&
+      p.pos.distanceTo(Game.spikeDropped) < 1.6) {
+    p.hasSpike = true; Game.spikeCarrier = p; Game.spikeDropped = null;
+    if (Game.spikeMesh) Game.spikeMesh.visible = false;
+    radio(p, 'Got the spike — plant it on A or B!');
+  }
   let action = null, dur = 0, prog = 0;
   if (bomb.state === 'idle' && p.hasSpike) {
     for (const key of ['A', 'B']) {
@@ -1322,6 +1379,7 @@ function hidePause() { $('pause').classList.add('hidden'); }
 
 /* ---------------- 10. player movement + main loop ---------------- */
 const playerVel = V3(0, 0, 0);
+const _pFwd = V3(0, 0, 0), _pRight = V3(0, 0, 0), _pMove = V3(0, 0, 0);
 let lastStepAt = 0;
 function updatePlayer(dt) {
   const p = Game.player;
@@ -1334,31 +1392,38 @@ function updatePlayer(dt) {
   p.crouch = crouching;
   const walking = Input.keys.ShiftLeft || Input.keys.ShiftRight;
   const speed = crouching ? CONFIG.crouchSpeed : walking ? CONFIG.walkSpeed : CONFIG.playerSpeed;
-  const fwd = V3(-Math.sin(p.yaw), 0, -Math.cos(p.yaw));
-  const right = V3(-fwd.z, 0, fwd.x);
-  const move = V3(0, 0, 0);
+  const fwd = _pFwd.set(-Math.sin(p.yaw), 0, -Math.cos(p.yaw));
+  const right = _pRight.set(-fwd.z, 0, fwd.x);
+  const move = _pMove.set(0, 0, 0);
   if (Input.keys.KeyW) move.add(fwd);
   if (Input.keys.KeyS) move.sub(fwd);
   if (Input.keys.KeyD) move.add(right);
   if (Input.keys.KeyA) move.sub(right);
   if (move.lengthSq() > 0) move.normalize().multiplyScalar(speed * (p.scoped ? 0.45 : 1));
+  // acceleration (criterion 2): velocity chases the wish direction instead
+  // of snapping to full speed, so stopping to aim pays and strafing has
+  // weight. Ground grips fast, air barely steers.
+  const accel = p.pos.y === 0 ? 12 : 5;
+  const k = Math.min(1, accel * dt);
+  playerVel.x += (move.x - playerVel.x) * k;
+  playerVel.z += (move.z - playerVel.z) * k;
   // jump / gravity (simple)
   if (Input.keys.Space && p.pos.y === 0) playerVel.y = CONFIG.jumpSpeed;
   playerVel.y -= CONFIG.gravity * dt;
-  const vel = V3(move.x, playerVel.y, move.z);
-  const prevX = p.pos.x, prevZ = p.pos.z;
+  const vel = playerVel; // collideMove only reads it (and zeroes y on landing)
   collideMove(p.pos, vel, dt, CONFIG.playerRadius, 1.7);
   if (p.pos.y === 0) playerVel.y = 0;
+  const hSpeed = Math.hypot(playerVel.x, playerVel.z);
   // footsteps
-  if (move.lengthSq() > 0 && p.pos.y === 0 && Game.time - lastStepAt > 0.38) { lastStepAt = Game.time; AudioSys.step(); }
+  if (hSpeed > 0.5 && p.pos.y === 0 && Game.time - lastStepAt > 0.38) { lastStepAt = Game.time; AudioSys.step(); }
   // camera
   const eye = crouching ? CONFIG.crouchEye : CONFIG.eyeHeight;
-  const bob = move.lengthSq() > 0 && p.pos.y === 0 ? Math.sin(Game.time * 11) * 0.035 : 0;
+  const bob = hSpeed > 0.5 && p.pos.y === 0 ? Math.sin(Game.time * 11) * 0.035 : 0;
   camera.position.set(p.pos.x, p.pos.y + eye + bob, p.pos.z);
   camera.rotation.set(p.pitch + (Game.shake > 0 ? rand(-1, 1) * Game.shake * 0.02 : 0), p.yaw, 0);
   // weapon bob + kick recovery
   if (viewGun) {
-    viewGun.position.x = 0.26 + (move.lengthSq() > 0 ? Math.sin(Game.time * 11) * 0.008 : 0);
+    viewGun.position.x = 0.26 + (hSpeed > 0.5 ? Math.sin(Game.time * 11) * 0.008 : 0);
     viewGun.position.y = -0.24 + bob * 0.4 + (p.reloading > 0 ? Math.sin(Game.time * 9) * 0.03 - 0.05 : 0);
     viewGun.position.z += ( -0.5 - viewGun.position.z) * Math.min(1, dt * 10);
     viewGun.rotation.x += (0 - viewGun.rotation.x) * Math.min(1, dt * 8);
@@ -1422,12 +1487,16 @@ function updateFx(dt) {
   Game.shake = Math.max(0, Game.shake - dt * 1.6);
 }
 
-let _lastT = performance.now();
-function loop() {
-  requestAnimationFrame(loop);
-  const now = performance.now();
-  const dt = Math.min((now - _lastT) / 1000, 0.05);
-  _lastT = now;
+/* Fixed-step simulation (criterion 5): the world advances in 1/60 s
+   steps, kept apart from rendering — the loop only accumulates real time
+   and draws the latest state each animation frame. Gameplay therefore
+   runs at the same speed on a 60 Hz laptop and a 240 Hz desktop, and a
+   slow frame can never teleport a bot through a wall (dt used to be
+   whatever the frame took, clamped). If rendering falls far behind, the
+   backlog is dropped instead of spiralling (slow motion, not a freeze). */
+const SIM_STEP = 1 / 60, SIM_MAX_STEPS = 8;
+let simAcc = 0;
+function stepSim(dt) {
   Game.time += dt;
   if (Game.phase === 'live' || Game.phase === 'buy' || Game.phase === 'roundEnd' || Game.demoMode) {
     if (Game.phase === 'buy') {
@@ -1460,14 +1529,26 @@ function loop() {
     }
     updateFx(dt);
   }
+}
+
+let _lastT = performance.now();
+function loop() {
+  requestAnimationFrame(loop);
+  const now = performance.now();
+  const frameDt = Math.min((now - _lastT) / 1000, 0.25);
+  _lastT = now;
+  simAcc += frameDt;
+  let steps = 0;
+  while (simAcc >= SIM_STEP && steps < SIM_MAX_STEPS) { stepSim(SIM_STEP); simAcc -= SIM_STEP; steps++; }
+  if (steps === SIM_MAX_STEPS) simAcc = 0; // behind: drop backlog, never spiral
   // scoreboard key (held)
   if (Input.keys.Tab) { renderScoreboard(); $('scoreboard').classList.remove('hidden'); }
   else $('scoreboard').classList.add('hidden');
   renderer.render(scene, camera);
-  // fps counter (cheap, 2/s)
-  if (!loop._t || Game.time - loop._t > 0.5) {
-    loop._t = Game.time;
-    $('fps').textContent = 'DUSTLINE Sector 7 · ' + Math.round(1 / Math.max(dt, 0.001)) + ' fps';
+  // fps counter (cheap, 2/s, on its own clock so it works in the menu too)
+  if (!loop._fpsAt || now - loop._fpsAt > 500) {
+    loop._fpsAt = now;
+    $('fps').textContent = 'DUSTLINE Sector 7 · ' + Math.round(1 / Math.max(frameDt, 0.001)) + ' fps';
   }
 }
 
@@ -1505,6 +1586,9 @@ function applyShotMode() {
     // ?demo=1 alone: plain bot-vs-bot match, no staging. Only ?shot=N stages.
     if (Game.shotMode <= 0) return true;
     // stage the scene per shot: first-person vantages with enemies in frame
+    // (the fps counter is a dev overlay whose number is meaningless under
+    // a software renderer, so staged shots hide it; real play keeps it)
+    $('fps').style.display = 'none';
     const vantages = {
       1: { pos: [0, 16], yaw: 0, pitch: 0, foes: [[0, 4], [-5, 0], [5, 2], [-2, -6], [6, -2]] },
       2: { pos: [20, 4], yaw: -2.84, pitch: 0, foes: [[22, 18], [26, 14], [20, 20], [24, 12], [28, 18]] },
@@ -1554,7 +1638,7 @@ function init() {
   }
   // test / grader hook: cheap, read-only status
   window.__DUSTLINE__ = {
-    version: '1.0.0', three: THREE.REVISION,
+    version: '1.1.0', three: THREE.REVISION,
     status: () => ({ phase: Game.phase, round: Game.round, score: Game.score, gameTime: +Game.time.toFixed(1), roundTime: +Game.roundTime.toFixed(1), playerAlive: !!Game.player?.alive, botsAlive: Game.bots.filter((b) => b.alive).length, bomb: Game.bomb.state, bots: Game.bots.map((b) => ({ n: b.name, t: b.team, hp: Math.round(b.hp), x: +b.pos.x.toFixed(1), z: +b.pos.z.toFixed(1), alive: b.alive })) }),
   };
   window.addEventListener('error', (e) => { (window.__DUSTLINE__.errors = window.__DUSTLINE__.errors || []).push(String(e.message)); });

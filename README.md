@@ -75,22 +75,31 @@ every round, so you both defend (defuse) and attack (plant).
 - `game/index.html` + `game/main.js` — the whole game: three.js 0.187.0
   (vendored `three.module.min.js` / `three.core.min.js`, byte for byte the
   kit's files) via an import map, one ES module, no build step.
-- `game/main.js` — renderer, fixed-step simulation, bot AI (waypoints,
-  bursts, reactions, callouts), weapons, economy, HUD and minimap.
+- `game/main.js` — renderer, fixed-step (1/60 s) simulation decoupled from
+  rendering, bot AI (waypoints, bursts, reactions, callouts), weapons,
+  economy, HUD and minimap. Hot loops reuse scratch vectors (no per-frame
+  allocation); bullets resolve the nearest of hit-mesh / wall collider /
+  player capsule, so walls stop bullets.
 - `screenshots/` — 4 real renders of the game's own code (`?shot=1..4`
   staged first-person views), 1280×480 JPEG, each under the 256 KiB gate.
 
 ## Checks
 
 - `main.ts` run twice → byte-identical output (`diff -r` clean);
-  dossier 540,330 bytes (< 1.5 MiB), source text 93,421 bytes (< 160 KiB)
-- Screenshots: 4 files, 1280×480, 79–89 KB each (limit 256 KiB)
+  dossier ~541 KB (< 1.5 MiB), source text ~97 KB (< 160 KiB)
+- Screenshots: 4 files, 1280×480, 76–89 KB each (limit 256 KiB)
 - three.js files byte-identical to the kit's 0.187.0 files; import map maps
   `"three"` to `./three.module.min.js`; no network reference anywhere in
   `game/` (no fetch, no external URL, no dynamic import)
 - Headless play-test (Chrome + SwiftShader): boots with no page errors,
-  bots fight and kill each other, rounds progress, HUD/minimap render
-- `node --check game/main.js && node --check main.ts` → OK
+  bots fight and kill each other, rounds progress (clock → roundEnd → buy
+  → round 2 live), HUD/minimap render
+- Scenario tests (headless, scripted): walls block bot and player shots
+  while open shots wound; a round never ends while the player (a Jackal)
+  is alive; the player picks up a dropped spike; 120 fixed steps advance
+  game time by exactly 2 s; movement accelerates and decays on release
+- `node --check game/main.js` → OK (`main.ts` is TypeScript: run it with
+  Node 22+, `node main.ts`, not `--check`)
 - Note: `makefun grade-local` refuses this competition by design — its
   scorer and reference data stay on the server, so the house grades it
   after submission. No local sealed score exists.
