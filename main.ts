@@ -41,8 +41,14 @@ async function copyTree(src: string, dest: string): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  await rm(OUT, { recursive: true, force: true });
+  // Never remove OUT itself: in the grader /output is a writable mount on a
+  // read-only filesystem, so removing it fails with EPERM as uid 65534 and
+  // the run exits non-zero. Clear only the entries this program writes,
+  // like the kit starter does.
   await mkdir(OUT, { recursive: true });
+  await rm(join(OUT, "game"), { recursive: true, force: true });
+  await rm(join(OUT, "screenshots"), { recursive: true, force: true });
+  await rm(join(OUT, "dossier.json"), { force: true });
 
   // 1. The playable game, as static files with no build step.
   await copyTree(join(ROOT, "game"), join(OUT, "game"));
