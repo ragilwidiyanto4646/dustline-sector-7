@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DUSTLINE // Sector 7 — Tactical FPS</title>
+<!--
+  DUSTLINE // Sector 7
+  A round-based tactical FPS in the style Counter-Strike made famous.
+  Original map, art, sounds and names. Single-player vs bots.
+  three.js 0.187.0, vendored locally. No build step, no network requests.
+  Open this file through any static server, e.g. `npx serve game` or
+  `python3 -m http.server` from this folder, then open the local address it prints.
+-->
+<style>
+  :root{ --amber:#ffb454; --cyan:#7fd4ff; --red:#ff5d5d; --panel:rgba(10,14,18,.82); }
+  *{ box-sizing:border-box; margin:0; padding:0; }
+  html,body{ width:100%; height:100%; overflow:hidden; background:#0b0e11;
+    font-family:"Segoe UI",system-ui,-apple-system,Roboto,Arial,sans-serif; color:#e8eef2;
+    -webkit-user-select:none; user-select:none; }
+  #app{ position:fixed; inset:0; }
+  canvas.game{ display:block; }
+  .hidden{ display:none !important; }
+
+  /* ---------- HUD ---------- */
+  #hud{ position:fixed; inset:0; pointer-events:none; z-index:5; }
+  #crosshair{ position:absolute; left:50%; top:50%; width:26px; height:26px; transform:translate(-50%,-50%); }
+  #crosshair .dot{ position:absolute; left:11px; top:11px; width:4px; height:4px; background:#fff; border-radius:50%; box-shadow:0 0 3px #000; }
+  #crosshair .l{ position:absolute; background:rgba(255,255,255,.9); box-shadow:0 0 2px #000; }
+  #crosshair .t{ left:12px; top:0; width:2px; height:8px; } #crosshair .b{ left:12px; bottom:0; width:2px; height:8px; }
+  #crosshair .lf{ left:0; top:12px; width:8px; height:2px; } #crosshair .rt{ right:0; top:12px; width:8px; height:2px; }
+  #hitmarker{ position:absolute; left:50%; top:50%; width:30px; height:30px; transform:translate(-50%,-50%) rotate(45deg); opacity:0; }
+  #hitmarker span{ position:absolute; background:#fff; } #hitmarker .a{ left:0; top:0; width:10px; height:2px; } #hitmarker .b{ right:0; top:0; width:10px; height:2px; }
+  #hitmarker .c{ left:0; bottom:0; width:10px; height:2px; } #hitmarker .d{ right:0; bottom:0; width:10px; height:2px; }
+  #hitmarker.kill span{ background:#ff5252; }
+  #dmg-vignette{ position:absolute; inset:0; opacity:0; pointer-events:none;
+    background:radial-gradient(ellipse at center, transparent 55%, rgba(255,30,30,.55) 100%); }
+  #flash{ position:absolute; inset:0; background:#fff; opacity:0; pointer-events:none; }
+  #scope{ position:absolute; inset:0; pointer-events:none; opacity:0; background:radial-gradient(circle at center, transparent 31vmin, #000 32vmin); }
+  #scope::after{ content:""; position:absolute; left:50%; top:0; bottom:0; width:1px; background:rgba(0,0,0,.8); }
+  #scope::before{ content:""; position:absolute; top:50%; left:0; right:0; height:1px; background:rgba(0,0,0,.8); }
+
+  #topbar{ position:absolute; top:10px; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:14px;
+    background:var(--panel); border:1px solid rgba(255,255,255,.12); border-radius:8px; padding:6px 14px; font-size:14px; }
+  #topbar .team{ font-weight:700; letter-spacing:.06em; } #topbar .ct{ color:var(--cyan); } #topbar .t{ color:var(--amber); }
+  #topbar .score{ font-size:20px; font-weight:800; }
+  #timer{ font-size:20px; font-weight:800; font-variant-numeric:tabular-nums; min-width:64px; text-align:center; }
+  #timer.low{ color:var(--red); animation:blink 1s steps(2) infinite; }
+  @keyframes blink{ 50%{ opacity:.35; } }
+  #round-label{ font-size:11px; opacity:.75; letter-spacing:.12em; text-transform:uppercase; }
+  #bomb-status{ font-size:12px; font-weight:700; color:#ff8080; }
+
+  #minimap{ position:absolute; top:10px; right:10px; width:190px; height:150px; background:var(--panel);
+    border:1px solid rgba(255,255,255,.14); border-radius:8px; }
+  #killfeed{ position:absolute; top:168px; right:10px; width:300px; display:flex; flex-direction:column; gap:4px; align-items:flex-end; }
+  #killfeed div{ background:var(--panel); border:1px solid rgba(255,255,255,.1); border-radius:5px; padding:3px 8px; font-size:12px; }
+  #killfeed .wpn{ color:var(--amber); } #killfeed .hs{ color:#ff8080; font-weight:700; }
+  #radio{ position:absolute; left:10px; bottom:170px; width:340px; display:flex; flex-direction:column; gap:3px; font-size:12px; }
+  #radio div{ color:#cfe6ff; text-shadow:0 1px 2px #000; } #radio b{ color:var(--cyan); }
+
+  #bottom-left{ position:absolute; left:14px; bottom:14px; }
+  #hp{ font-size:34px; font-weight:800; line-height:1; text-shadow:0 2px 6px #000; }
+  #hp small{ font-size:13px; font-weight:600; opacity:.8; }
+  #armor-bar{ width:190px; height:6px; background:rgba(255,255,255,.15); border-radius:3px; margin-top:6px; overflow:hidden; }
+  #armor-fill{ height:100%; width:0%; background:var(--cyan); }
+  #hp-bar{ width:190px; height:6px; background:rgba(255,255,255,.15); border-radius:3px; margin-top:4px; overflow:hidden; }
+  #hp-fill{ height:100%; width:100%; background:#7ddc7d; }
+  #money{ margin-top:8px; font-size:15px; font-weight:700; color:#9fe870; text-shadow:0 1px 3px #000; }
+
+  #bottom-right{ position:absolute; right:16px; bottom:14px; text-align:right; text-shadow:0 2px 6px #000; }
+  #ammo{ font-size:36px; font-weight:800; line-height:1; } #ammo small{ font-size:18px; opacity:.7; }
+  #weapon-name{ font-size:13px; letter-spacing:.14em; text-transform:uppercase; opacity:.9; }
+  #firemode{ font-size:11px; opacity:.65; letter-spacing:.1em; }
+  #interact{ position:absolute; left:50%; top:58%; transform:translateX(-50%); font-size:15px; font-weight:700;
+    background:var(--panel); border:1px solid rgba(255,255,255,.2); padding:8px 14px; border-radius:7px; }
+  #interact .bar{ height:5px; background:rgba(255,255,255,.2); border-radius:3px; margin-top:6px; overflow:hidden; }
+  #interact .fill{ height:100%; width:0%; background:var(--amber); }
+  #hint{ position:absolute; left:50%; bottom:110px; transform:translateX(-50%); font-size:12px; opacity:.75; text-shadow:0 1px 3px #000; }
+
+  #banner{ position:absolute; left:50%; top:26%; transform:translate(-50%,-50%); text-align:center; opacity:0; transition:opacity .25s; }
+  #banner.show{ opacity:1; }
+  #banner h1{ font-size:44px; letter-spacing:.14em; text-shadow:0 3px 12px #000; }
+  #banner h1.win{ color:#9fe870; } #banner h1.lose{ color:#ff6b6b; } #banner h1.draw{ color:var(--amber); }
+  #banner p{ font-size:15px; opacity:.9; text-shadow:0 2px 6px #000; }
+
+  /* ---------- Overlays (menu / buy / score / end) ---------- */
+  .overlay{ position:fixed; inset:0; z-index:10; display:flex; align-items:center; justify-content:center; background:rgba(5,8,10,.72); backdrop-filter:blur(3px); }
+  .card{ width:min(860px,94vw); max-height:92vh; overflow:auto; background:#10161c; border:1px solid rgba(255,255,255,.14);
+    border-radius:14px; padding:26px 30px; box-shadow:0 20px 60px rgba(0,0,0,.6); }
+  .card h1{ font-size:38px; letter-spacing:.1em; } .card h1 .accent{ color:var(--amber); }
+  .card h2{ font-size:13px; letter-spacing:.22em; text-transform:uppercase; color:var(--cyan); margin-bottom:6px; }
+  .card p{ font-size:14px; line-height:1.55; opacity:.92; margin:8px 0; }
+  .card .tag{ display:inline-block; font-size:11px; letter-spacing:.14em; border:1px solid rgba(255,255,255,.25); border-radius:20px; padding:3px 10px; margin:2px 4px 2px 0; opacity:.85; }
+  button{ pointer-events:auto; cursor:pointer; font:inherit; font-weight:700; letter-spacing:.06em; color:#10161c;
+    background:var(--amber); border:0; border-radius:8px; padding:12px 22px; }
+  button:hover{ filter:brightness(1.1); } button.ghost{ background:transparent; color:#e8eef2; border:1px solid rgba(255,255,255,.3); }
+  .row{ display:flex; gap:10px; flex-wrap:wrap; margin-top:16px; align-items:center; }
+  .cols{ display:grid; grid-template-columns:1fr 1fr; gap:18px; margin-top:14px; }
+  .cols h3{ font-size:13px; letter-spacing:.14em; text-transform:uppercase; margin-bottom:8px; color:var(--amber); }
+  .cols ul{ list-style:none; font-size:13px; line-height:1.8; opacity:.9; }
+  .cols li b{ display:inline-block; min-width:92px; color:#fff; }
+  kbd{ background:#222c34; border:1px solid #4a5a66; border-bottom-width:2px; border-radius:4px; padding:1px 6px; font-size:12px; }
+  .muted{ opacity:.65; font-size:12px; }
+  table.shop{ width:100%; border-collapse:collapse; margin-top:10px; font-size:14px; }
+  table.shop td, table.shop th{ padding:8px 6px; border-bottom:1px solid rgba(255,255,255,.08); text-align:left; }
+  table.shop tr.sel{ background:rgba(255,180,84,.14); } table.shop tr{ cursor:pointer; }
+  table.shop .price{ color:#9fe870; font-weight:700; text-align:right; }
+  #buy-money{ font-size:16px; font-weight:800; color:#9fe870; }
+  table.score{ width:100%; border-collapse:collapse; font-size:13px; margin-top:8px; }
+  table.score td, table.score th{ padding:5px 8px; border-bottom:1px solid rgba(255,255,255,.07); text-align:left; }
+  table.score .ct{ color:var(--cyan); } table.score .t{ color:var(--amber); }
+  #fps{ position:fixed; left:8px; top:6px; z-index:6; font-size:11px; opacity:.6; pointer-events:none; text-shadow:0 1px 2px #000; }
+  @media (max-width:760px){ .cols{ grid-template-columns:1fr; } #minimap{ width:130px; height:104px; } .card h1{ font-size:28px; } }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="fps"></div>
+
+<div id="hud" class="hidden">
+  <div id="dmg-vignette"></div><div id="flash"></div><div id="scope"></div>
+  <div id="crosshair"><span class="l t"></span><span class="l b"></span><span class="l lf"></span><span class="l rt"></span><span class="dot"></span></div>
+  <div id="hitmarker"><span class="a"></span><span class="b"></span><span class="c"></span><span class="d"></span></div>
+  <div id="topbar">
+    <span class="team ct">WARDENS <span class="score" id="score-ct">0</span></span>
+    <span id="round-label">ROUND 1</span>
+    <span id="timer">1:40</span>
+    <span id="bomb-status"></span>
+    <span class="team t"><span class="score" id="score-t">0</span> JACKALS</span>
+  </div>
+  <canvas id="minimap" width="380" height="300"></canvas>
+  <div id="killfeed"></div>
+  <div id="radio"></div>
+  <div id="bottom-left">
+    <div id="hp">100 <small>HP</small></div>
+    <div id="armor-bar"><div id="armor-fill"></div></div>
+    <div id="hp-bar"><div id="hp-fill"></div></div>
+    <div id="money">$800</div>
+  </div>
+  <div id="bottom-right">
+    <div id="ammo">12 <small>/ 36</small></div>
+    <div id="weapon-name">P9 SIDEARM</div>
+    <div id="firemode">SEMI · SCROLL TO SWAP</div>
+  </div>
+  <div id="interact" class="hidden">Hold <kbd>E</kbd> — <span id="interact-text">PLANT THE SPIKE</span><div class="bar"><div class="fill" id="interact-fill"></div></div></div>
+  <div id="hint">WASD move · SHIFT walk · SPACE jump · CTRL crouch · R reload · B buy · 4 smoke · 5 flash · TAB score</div>
+  <div id="banner"><h1 id="banner-title"></h1><p id="banner-sub"></p></div>
+</div>
+
+<!-- Main menu -->
+<div id="menu" class="overlay">
+  <div class="card">
+    <h2>Round-based tactical FPS · three.js · single-player vs bots · 100% offline</h2>
+    <h1>DUSTLINE <span class="accent">// SECTOR 7</span></h1>
+    <p>Two crews fight over a desert freight yard. <b style="color:#7fd4ff">Wardens</b> hold the sites,
+       <b style="color:#ffb454">Jackals</b> push in to plant the spike — or wipe the other crew out.
+       First crew to <b>5 rounds</b> takes the match. Win rounds, earn cash, buy better guns.</p>
+    <p><span class="tag">5v5 + BOTS</span><span class="tag">PLANT / DEFUSE</span><span class="tag">BUY ECONOMY</span>
+       <span class="tag">SMOKE &amp; FLASH</span><span class="tag">2 SITES · A / B</span><span class="tag">NO DOWNLOAD</span></p>
+    <div class="cols">
+      <div><h3>How to play</h3><ul>
+        <li><b>Mouse</b> look &amp; aim</li><li><b>W A S D</b> move · <b>Shift</b> walk quietly</li>
+        <li><b>Click</b> fire · <b>R</b> reload · <b>Q</b> last weapon</li>
+        <li><b>E</b> hold to plant / defuse the spike</li>
+        <li><b>B</b> buy menu during freeze time</li><li><b>Tab</b> scoreboard · <b>Esc</b> pause</li>
+      </ul></div>
+      <div><h3>Your crew</h3><ul>
+        <li><b>You</b> Warden — point player</li>
+        <li><b>4 bots</b> on your side hold angles</li>
+        <li><b>5 bots</b> push the sites</li>
+        <li><b>Spike</b> beeps faster as it arms</li>
+        <li><b>Tip</b> crouch + burst fire = lasers</li>
+      </ul></div>
+    </div>
+    <div class="row">
+      <button id="btn-play">▶ &nbsp;DEPLOY — CLICK TO PLAY</button>
+      <button id="btn-spectate" class="ghost">Watch bots fight (demo)</button>
+      <label class="muted">Difficulty
+        <select id="difficulty" style="background:#222c34;color:#fff;border:1px solid #4a5a66;border-radius:6px;padding:8px;">
+          <option value="recruit">Recruit — relaxed bots</option>
+          <option value="regular" selected>Regular — fair fight</option>
+          <option value="veteran">Veteran — sharp bots</option>
+        </select></label>
+    </div>
+    <p class="muted">Best on desktop Chrome / Edge / Firefox with WebGL2. Sound is synthesized in-browser — no audio files, no network, nothing leaves your machine. Original game: not affiliated with Valve or Counter-Strike.</p>
+  </div>
+</div>
+
+<!-- Buy menu -->
+<div id="buy" class="overlay hidden">
+  <div class="card">
+    <h2>Buy phase — freeze time</h2>
+    <h1 style="font-size:26px">SUPPLY CRATE</h1>
+    <p>Your cash: <span id="buy-money">$800</span> &nbsp;·&nbsp; <span class="muted">Click a row or press its number. B / Esc closes.</span></p>
+    <table class="shop" id="shop-table"></table>
+    <div class="row"><button id="btn-close-buy">DONE — BACK TO FIGHT</button></div>
+  </div>
+</div>
+
+<!-- Scoreboard -->
+<div id="scoreboard" class="overlay hidden" style="background:rgba(5,8,10,.45)">
+  <div class="card" style="width:min(640px,94vw)">
+    <h2 id="sb-title">Scoreboard</h2>
+    <div id="sb-body"></div>
+    <p class="muted">Hold TAB to keep this open. First to 5 rounds wins the match.</p>
+  </div>
+</div>
+
+<!-- Match end -->
+<div id="match-end" class="overlay hidden">
+  <div class="card" style="text-align:center">
+    <h2 id="end-kicker">Match over</h2>
+    <h1 id="end-title">WARDENS WIN</h1>
+    <p id="end-sub"></p>
+    <div id="end-stats" style="font-size:15px;line-height:1.9"></div>
+    <div class="row" style="justify-content:center"><button id="btn-rematch">↻ &nbsp;REMATCH</button>
+    <button id="btn-menu" class="ghost">Main menu</button></div>
+  </div>
+</div>
+
+<div id="pause" class="overlay hidden">
+  <div class="card" style="width:min(480px,94vw);text-align:center">
+    <h2>Paused</h2><h1 style="font-size:26px">TAKE A BREATHER</h1>
+    <p class="muted">Pointer unlocked. Click resume to jump back in — the round keeps running.</p>
+    <div class="row" style="justify-content:center"><button id="btn-resume">RESUME</button></div>
+  </div>
+</div>
+
+<script type="importmap">
+{ "imports": { "three": "./three.module.min.js" } }
+</script>
+<script type="module" src="./main.js"></script>
+</body>
+</html>
