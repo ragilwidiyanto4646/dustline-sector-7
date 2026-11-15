@@ -1576,7 +1576,13 @@ function applyShotMode() {
   const q = new URLSearchParams(location.search);
   Game.shotMode = parseInt(q.get('shot') || '0', 10);
   if (q.get('demo') === '1' || Game.shotMode > 0) {
-    Game.difficulty = q.get('diff') || 'regular';
+    // ?diff=... is attacker-controlled input: only the three known keys are
+    // accepted, anything else (incl. 'Veteran', 'hard', '') falls back to
+    // 'regular'. An unchecked value used to make DIFF[Game.difficulty]
+    // undefined and throw in botThink on first enemy contact, freezing the
+    // game with an uncaught exception every frame.
+    const diffParam = q.get('diff');
+    Game.difficulty = diffParam === 'recruit' || diffParam === 'regular' || diffParam === 'veteran' ? diffParam : 'regular';
     Game.demoMode = true;
     $('menu').classList.add('hidden');
     $('hud').classList.remove('hidden');
